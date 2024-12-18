@@ -1,0 +1,205 @@
+import os
+import pandas as pd
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+from tqdm import tqdm  # 导入进度条模块
+import schedule  # 定时任务模块
+import time  # 用于定时循环
+import json  # 用于保存和读取设置
+
+def print_logo():
+    logo = """
+  ____           _                                 _                  _                   _                             _ 
+ | __ )    ___  (_)  _   _    __ _   _ __    ___  | |__     ___      | |__    _   _   _  | |__     __ _    ___    ____ (_)
+ |  _ \   / _ \ | | | | | |  / _` | | '_ \  / __| | '_ \   / _ \     | '_ \  | | | | (_) | '_ \   / _` |  / _ \  |_  / | |
+ | |_) | |  __/ | | | |_| | | (_| | | | | | \__ \ | | | | |  __/  _  | |_) | | |_| |  _  | |_) | | (_| | | (_) |  / /  | |
+ |____/   \___| |_|  \__, |  \__,_| |_| |_| |___/ |_| |_|  \___| (_) |_.__/   \__, | (_) |_.__/   \__,_|  \___/  /___| |_|
+                     |___/                                                    |___/                                       
+
+    URL and MP4 Checker - Stay Updated
+    """
+    print(logo)
+
+def check_url_for_errors_and_mp4(url):
+    """检查URL是否返回HTTP错误并验证是否指向MP4文件"""
+    try:
+        response = requests.head(url, timeout=10, allow_redirects=True)
+        if response.status_code == 200:
+            content_type = response.headers.get('Content-Type', '')
+            return content_type == 'video/mp4'
+        return False
+    except requests.RequestException as e:
+        print(f"Error fetching the URL {url}: {e}")
+        return False
+
+def extract_urls_from_excel(excel_file, sheet_name='Sheet1'):
+    """从Excel文件中提取所有可能的URL"""
+    if not os.path.exists(excel_file):
+        raise FileNotFoundError(f"The file '{excel_file}' does not exist. Please check the path.")
+
+    df = pd.read_excel(excel_file, sheet_name=sheet_name)
+    url_pattern = re.compile(
+        r'https?://'  # http:// 或 https://
+        r'[a-zA-Z0-9.-]+'  # 域名部分
+        r'(?:\.[a-zA-Z]{2,})'  # 顶级域名部分
+        r'(?:[/?#]\S*)?'  # 路径部分
+    )
+    urls = []
+
+    for cell in df.select_dtypes(include=['object']).stack():
+        if isinstance(cell, str):
+            matches = url_pattern.findall(cell)
+            urls.extend(matches)
+
+    return list(set(urls))  # 去重
+
+def filter_urls_and_count_healthy_multithreaded(excel_file, sheet_name='Sheet1', max_workers=10):
+    """
+    从Excel文件中提取URL列表，使用多线程筛选错误链接，并验证是否指向MP4文件。
+
+    :param excel_file: Excel文件路径
+    :param sheet_name: 工作表名称
+    :param max_workers: 线程池中的最大线程数
+    :return: MP4链接列表和失效链接列表
+    """
+    urls = extract_urls_from_excel(excel_file, sheet_name)
+    mp4_urls = []
+    failed_urls = []
+
+    # 使用ThreadPoolExecutor来并行化URL检查
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_url = {executor.submit(check_url_for_errors_and_mp4, url): url for url in urls}
+
+        # 使用 tqdm 显示进度条
+        for future in tqdm(as_completed(future_to_url), total=len(future_to_url), desc="Processing URLs"):
+            url = future_to_url[future]
+            try:
+                if future.result():
+                    mp4_urls.append(url)
+                else:
+                    failed_urls.append(url)
+            except Exception as exc:
+                print(f"URL {url} generated an exception: {exc}")
+                failed_urls.append(url)
+
+    return mp4_urls, failed_urls
+
+import os
+import subprocess
+
+def open_file_in_front(file_path):
+    """根据操作系统打开文件到前台"""
+    if os.name == 'nt':  # Windows系统
+        os.startfile(file_path)
+    elif os.uname().sysname == 'Darwin':  # macOS系统
+        subprocess.run(["open", file_path])
+    elif os.name == 'posix':  # Linux系统
+        subprocess.run(["xdg-open", file_path])
+
+def process_excel_file(excel_file_path, sheet_name='Sheet1', max_threads=20):
+    """处理Excel文件并保存结果"""
+    if not os.path.isfile(excel_file_path):
+        print(f"错误: 文件路径 '{excel_file_path}' 无效或文件不存在。")
+        return
+
+    try:
+        mp4_urls, failed_urls = filter_urls_and_count_healthy_multithreaded(excel_file_path, sheet_name, max_threads)
+
+        # 获取Excel文件所在的目录
+        output_directory = os.path.dirname(excel_file_path)
+
+        # 新增链接时覆盖失效链接文件
+        failed_urls_path = os.path.join(output_directory, "失效链接.txt")
+
+        # 覆盖旧的失效链接文件
+        with open(failed_urls_path, "w", encoding="utf-8") as f:
+            if failed_urls:
+                f.write("\n".join(failed_urls))
+
+        # 打开失效链接文件
+        open_file_in_front(failed_urls_path)
+
+        # 保存MP4链接到文件
+        mp4_urls_path = os.path.join(output_directory, "健康链接.txt")
+        with open(mp4_urls_path, "w", encoding="utf-8") as f:
+            if mp4_urls:
+                f.write("MP4链接:\n")
+                f.write("\n".join(mp4_urls))
+
+        # 输出统计信息
+        print(f"失效链接数量: {len(failed_urls)}，结果已保存到 {failed_urls_path}")
+        print(f"MP4链接数量: {len(mp4_urls)}，结果已保存到 {mp4_urls_path}")
+
+    except FileNotFoundError as e:
+        print(e)
+    except Exception as e:
+        print(f"发生了一个意外错误: {e}")
+
+def save_settings(settings_path, excel_file_path, interval_minutes):
+    """保存设置到JSON文件"""
+    settings = {
+        "excel_file_path": excel_file_path,
+        "interval_minutes": interval_minutes
+    }
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f)
+    print(f"设置已保存到 {settings_path}")
+
+def load_settings(settings_path):
+    """加载保存的设置"""
+    if os.path.exists(settings_path):
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+            return settings.get("excel_file_path"), settings.get("interval_minutes", 60)
+    return None, None
+
+def schedule_task(excel_file_path, interval_minutes=60):
+    """定时执行Excel文件处理"""
+    print(f"任务已启动，每隔 {interval_minutes} 分钟执行一次检测...")
+
+    # 使用 schedule 安排任务
+    schedule.every(interval_minutes).minutes.do(process_excel_file, excel_file_path)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)  # 避免频繁占用CPU资源
+
+if __name__ == "__main__":
+    print_logo()  # 打印LOGO
+
+    # 尝试加载之前保存的设置
+    settings_path = "settings.json"
+    saved_excel_path, saved_interval = load_settings(settings_path)
+
+    if saved_excel_path:
+        print(f"加载了之前保存的设置：文件路径: {saved_excel_path}, 检测间隔: {saved_interval} 分钟")
+        excel_file_path = saved_excel_path
+        interval_minutes = saved_interval
+        # 不再询问是否保存设置，直接开始定时任务
+    else:
+        print("请输入Excel文件的路径:")
+        excel_file_path = input().strip()
+
+        if not os.path.isfile(excel_file_path):
+            print(f"错误: 文件路径 '{excel_file_path}' 无效或文件不存在。")
+            exit(1)
+
+        print("请输入定时检测的时间间隔（分钟，默认60）:")
+        try:
+            interval_minutes = int(input().strip())
+        except ValueError:
+            interval_minutes = 60
+
+        # 询问是否保存设置
+        print("是否保存当前设置以供下次使用？(y/n):")
+        save_choice = input().strip().lower()
+        if save_choice == 'y':
+            save_settings(settings_path, excel_file_path, interval_minutes)
+
+    # 进行一次检测
+    print("开始进行初始检测...")
+    process_excel_file(excel_file_path)
+
+    # 进入定时检测
+    schedule_task(excel_file_path, interval_minutes)
